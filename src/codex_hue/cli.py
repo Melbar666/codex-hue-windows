@@ -2,7 +2,7 @@
 """Use a Philips Hue room as a concurrency-safe Codex work indicator."""
 
 import argparse
-import fcntl
+import errno
 import hashlib
 import hmac
 import http.client
@@ -18,6 +18,11 @@ import sys
 import tempfile
 import time
 import urllib.request
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 DEFAULT_BUSY = {
@@ -135,29 +140,64 @@ def write_json_atomic(path, value):
 
 
 class FileLock:
+    # Dependency-free exclusive file lock for Windows and POSIX.
     def __init__(self, path, nonblocking=False):
         self.path = path
-        self.nonblocking = nonblocking
+        self.nonblocking = bool(nonblocking)
+        self.descriptor = None
+
+    def _close(self):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
 
     def __enter__(self):
         ensure_data_dir()
         self.descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+
+        if os.name == "nt":
+            # msvcrt.locking locks a byte range from the current file position.
+            # Keep one byte in every lock file and always lock byte zero.
+            if os.fstat(self.descriptor).st_size == 0:
+                os.write(self.descriptor, b"\0")
+                os.fsync(self.descriptor)
+
+            while True:
+                os.lseek(self.descriptor, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(self.descriptor, msvcrt.LK_NBLCK, 1)
+                    return self
+                except OSError as error:
+                    busy_errors = (errno.EACCES, errno.EAGAIN, errno.EDEADLK)
+                    if error.errno not in busy_errors:
+                        self._close()
+                        raise
+                    if self.nonblocking:
+                        self._close()
+                        return None
+                    time.sleep(0.05)
+
         flags = fcntl.LOCK_EX
         if self.nonblocking:
             flags |= fcntl.LOCK_NB
         try:
             fcntl.flock(self.descriptor, flags)
         except BlockingIOError:
-            os.close(self.descriptor)
-            self.descriptor = None
+            self._close()
             return None
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self.descriptor is None:
             return
-        fcntl.flock(self.descriptor, fcntl.LOCK_UN)
-        os.close(self.descriptor)
+        try:
+            if os.name == "nt":
+                os.lseek(self.descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(self.descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        finally:
+            self._close()
 
 
 def StateLock():
@@ -494,6 +534,24 @@ def enqueue_event(event_name, session_id, turn_id):
         write_json_atomic(queue_path(), queue)
 
 
+def worker_popen_kwargs():
+    # Return detached worker settings for the current operating system.
+    options = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        options["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+    else:
+        options["start_new_session"] = True
+    return options
+
+
 def spawn_drain_worker():
     command = [
         sys.executable,
@@ -504,17 +562,7 @@ def spawn_drain_worker():
     if os.environ.get("CODEX_HUE_FOREGROUND") == "1":
         drain_events()
         return
-    with open(os.devnull, "rb") as stdin_handle, open(
-        os.devnull, "ab"
-    ) as output_handle:
-        subprocess.Popen(
-            command,
-            stdin=stdin_handle,
-            stdout=output_handle,
-            stderr=output_handle,
-            close_fds=True,
-            start_new_session=True,
-        )
+    subprocess.Popen(command, **worker_popen_kwargs())
 
 
 def dispatch_event(event_name, session_id, turn_id):
